@@ -1,0 +1,1383 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts << 'EOF_INK'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "InkToText"
+          include(":app")
+          EOF_INK
+          cat > build.gradle.kts << 'EOF_INK'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_INK
+          cat > gradle.properties << 'EOF_INK'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_INK
+          mkdir -p app
+          cat > app/build.gradle.kts << 'EOF_INK'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.inktotext"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.inktotext"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.mlkit:digital-ink-recognition:18.1.0")
+          }
+          EOF_INK
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml << 'EOF_INK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+              <application
+                  android:label="KRISH"
+                  android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_INK
+          mkdir -p app/src/main/java/com/example/inktotext
+          cat > app/src/main/java/com/example/inktotext/MainActivity.kt << 'EOF_INK'
+          package com.example.inktotext
+
+          import android.Manifest
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.provider.MediaStore
+          import android.speech.RecognizerIntent
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.HorizontalScrollView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+          import com.google.mlkit.common.model.DownloadConditions
+          import com.google.mlkit.common.model.RemoteModelManager
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognition
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModel
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModelIdentifier
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognizer
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognizerOptions
+          import com.google.mlkit.vision.digitalink.RecognitionContext
+          import com.google.mlkit.vision.digitalink.WritingArea
+          import com.google.mlkit.vision.digitalink.Ink
+
+          class DrawingView(context: Context) : View(context) {
+              class TextItem(
+                  val text: String, val copy: String, val cx: Float, val baseline: Float,
+                  val size: Float, val color: Int, val sup: Boolean
+              ) { var group = 0 }
+
+              class LineItem(
+                  val x1: Float, val y1: Float, val x2: Float, val y2: Float, val color: Int
+              ) { var group = 0 }
+
+              class Group(val copy: String, val y: Float, val x0: Float, val size: Float, val count: Int)
+
+              class PStroke(val stroke: Ink.Stroke, val path: Path, val color: Int)
+
+              var penColor = Color.BLACK
+              var eraser = false
+              private val eraseRadius = 40f
+              private val palmSize = 60f * context.resources.displayMetrics.density
+              private var erasing = false
+              private var lastStylus = 0L
+              private var eraseX = 0f
+              private var eraseY = 0f
+              private var eraseShowR = 0f
+              private val circlePaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 4f; isAntiAlias = true; color = 0xFF9E9E9E.toInt()
+              }
+
+              private val inkPaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 8f; isAntiAlias = true
+                  strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND
+              }
+              private val linePaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 6f; isAntiAlias = true
+                  strokeCap = Paint.Cap.ROUND
+              }
+              private val textPaint = Paint().apply {
+                  isAntiAlias = true; typeface = Typeface.SANS_SERIF; textAlign = Paint.Align.CENTER
+              }
+              private var curPath = Path()
+              private var curColor = Color.BLACK
+              private var strokeBuilder: Ink.Stroke.Builder? = null
+
+              val pending = mutableListOf<PStroke>()
+              private val items = mutableListOf<TextItem>()
+              private val lineItems = mutableListOf<LineItem>()
+              private val groups = HashMap<Int, Group>()
+
+              var onStrokeFinished: (() -> Unit)? = null
+              var onStrokeStarted: (() -> Unit)? = null
+
+              init { setBackgroundColor(Color.WHITE) }
+
+              override fun onDraw(canvas: Canvas) {
+                  for (p in pending) { inkPaint.color = p.color; canvas.drawPath(p.path, inkPaint) }
+                  inkPaint.color = curColor
+                  canvas.drawPath(curPath, inkPaint)
+                  for (ln in lineItems) {
+                      linePaint.color = ln.color
+                      canvas.drawLine(ln.x1, ln.y1, ln.x2, ln.y2, linePaint)
+                  }
+                  for (ti in items) {
+                      textPaint.color = ti.color
+                      textPaint.textSize = ti.size
+                      canvas.drawText(ti.text, ti.cx, ti.baseline, textPaint)
+                  }
+                  if (erasing) canvas.drawCircle(eraseX, eraseY, eraseShowR, circlePaint)
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val x = e.x; val y = e.y; val t = SystemClock.uptimeMillis()
+                  val now = SystemClock.uptimeMillis()
+                  if (e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) lastStylus = now
+                  val stylusNear = now - lastStylus < 1000
+                  var bigIdx = -1
+                  var bigR = eraseRadius
+                  for (i in 0 until e.pointerCount) {
+                      val tt = e.getToolType(i)
+                      val big = tt == MotionEvent.TOOL_TYPE_FINGER && !stylusNear &&
+                              e.getTouchMajor(i) >= palmSize
+                      if (tt == MotionEvent.TOOL_TYPE_ERASER || big) {
+                          bigIdx = i
+                          bigR = maxOf(eraseRadius, e.getTouchMajor(i) / 2f)
+                          break
+                      }
+                  }
+                  val twoFingers = e.pointerCount >= 2 && !stylusNear
+                  if (eraser || bigIdx >= 0 || twoFingers || erasing) {
+                      val ma = e.actionMasked
+                      if (ma == MotionEvent.ACTION_UP || ma == MotionEvent.ACTION_CANCEL) {
+                          if (erasing) { erasing = false; onStrokeFinished?.invoke() }
+                          invalidate()
+                          return true
+                      }
+                      if (!erasing) {
+                          erasing = true
+                          strokeBuilder = null
+                          curPath = Path()
+                          onStrokeStarted?.invoke()
+                      }
+                      val r = if (bigIdx >= 0) bigR else eraseRadius
+                      for (i in 0 until e.pointerCount) erase(e.getX(i), e.getY(i), r)
+                      eraseX = e.getX(0); eraseY = e.getY(0); eraseShowR = r
+                      invalidate()
+                      return true
+                  }
+
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          onStrokeStarted?.invoke()
+                          curColor = penColor
+                          curPath = Path().also { it.moveTo(x, y) }
+                          strokeBuilder = Ink.Stroke.builder().also {
+                              it.addPoint(Ink.Point.create(x, y, t))
+                          }
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (strokeBuilder == null) return true
+                          curPath.lineTo(x, y)
+                          strokeBuilder?.addPoint(Ink.Point.create(x, y, t))
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          if (strokeBuilder == null) return true
+                          curPath.lineTo(x, y)
+                          strokeBuilder?.addPoint(Ink.Point.create(x, y, t))
+                          strokeBuilder?.let { pending.add(PStroke(it.build(), curPath, curColor)) }
+                          curPath = Path()
+                          strokeBuilder = null
+                          onStrokeFinished?.invoke()
+                      }
+                      else -> return false
+                  }
+                  invalidate()
+                  return true
+              }
+
+              private fun distToSegment(px: Float, py: Float, ln: LineItem): Float {
+                  val dx = ln.x2 - ln.x1; val dy = ln.y2 - ln.y1
+                  val len2 = dx * dx + dy * dy
+                  var t = if (len2 == 0f) 0f else ((px - ln.x1) * dx + (py - ln.y1) * dy) / len2
+                  t = t.coerceIn(0f, 1f)
+                  val cx = ln.x1 + t * dx; val cy = ln.y1 + t * dy
+                  return Math.hypot((px - cx).toDouble(), (py - cy).toDouble()).toFloat()
+              }
+
+              private fun erase(x: Float, y: Float, rad: Float) {
+                  pending.removeAll { p ->
+                      p.stroke.points.any {
+                          Math.hypot((it.x - x).toDouble(), (it.y - y).toDouble()) < rad
+                      }
+                  }
+                  lineItems.removeAll { ln -> distToSegment(x, y, ln) < rad }
+                  items.removeAll { item ->
+                      textPaint.textSize = item.size
+                      val w = textPaint.measureText(item.text) / 2 + rad
+                      x in (item.cx - w)..(item.cx + w) &&
+                              y in (item.baseline - item.size - rad / 2)..(item.baseline + item.size * 0.3f + rad / 2)
+                  }
+              }
+
+              fun commit(
+                  done: List<PStroke>, newItems: List<TextItem>,
+                  newLines: List<LineItem>, newGroups: Map<Int, Group>
+              ) {
+                  pending.removeAll { p -> done.any { it === p } }
+                  items.addAll(newItems)
+                  lineItems.addAll(newLines)
+                  groups.putAll(newGroups)
+                  invalidate()
+              }
+
+              fun clearAll() {
+                  pending.clear(); items.clear(); lineItems.clear(); groups.clear()
+                  curPath = Path(); strokeBuilder = null
+                  invalidate()
+              }
+
+              fun toBitmap(): Bitmap {
+                  val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                  draw(Canvas(bmp))
+                  return bmp
+              }
+
+              fun plainText(): String {
+                  class E(val y: Float, val x0: Float, val size: Float, val text: String)
+                  val entries = mutableListOf<E>()
+                  for ((g, list) in items.groupBy { it.group }) {
+                      val info = groups[g]
+                      if (info != null && info.count == list.size) {
+                          entries.add(E(info.y, info.x0, info.size, info.copy))
+                      } else {
+                          val normals = list.filter { !it.sup }
+                          val ys = (if (normals.isEmpty()) list else normals).map { it.baseline }
+                          entries.add(E(ys.average().toFloat(), list.minOf { it.cx }, list[0].size,
+                              list.sortedBy { it.cx }.joinToString("") { it.copy }))
+                      }
+                  }
+                  val lines = mutableListOf<MutableList<E>>()
+                  for (e in entries.sortedBy { it.y }) {
+                      val ln = lines.firstOrNull { Math.abs(it[0].y - e.y) < e.size * 0.6f }
+                      if (ln != null) ln.add(e) else lines.add(mutableListOf(e))
+                  }
+                  return lines.joinToString("\n") { ln ->
+                      ln.sortedBy { it.x0 }.joinToString("") { it.text }
+                  }
+              }
+          }
+
+          private class Parser(val s: String) {
+              var i = 0
+              private fun peek(): Char = if (i < s.length) s[i] else '\u0000'
+
+              fun parse(): Double {
+                  val v = expr()
+                  if (i != s.length) throw IllegalArgumentException()
+                  return v
+              }
+
+              private fun expr(): Double {
+                  var v = term()
+                  while (peek() == '+' || peek() == '-') {
+                      val op = s[i++]
+                      val r = term()
+                      v = if (op == '+') v + r else v - r
+                  }
+                  return v
+              }
+
+              private fun term(): Double {
+                  var v = power()
+                  while (true) {
+                      val c = peek()
+                      if (c == '*') { i++; v *= power() }
+                      else if (c == '/') { i++; v /= power() }
+                      else if (c == '(' || c == 's' || c.isDigit() || c == '.') v *= power()
+                      else break
+                  }
+                  return v
+              }
+
+              private fun power(): Double {
+                  val b = unary()
+                  if (peek() == '^') { i++; return Math.pow(b, unary()) }
+                  return b
+              }
+
+              private fun unary(): Double {
+                  if (peek() == '-') { i++; return -unary() }
+                  if (peek() == '+') { i++; return unary() }
+                  return atom()
+              }
+
+              private fun atom(): Double {
+                  if (s.startsWith("sqrt", i)) { i += 4; return Math.sqrt(atom()) }
+                  if (peek() == '(') {
+                      i++
+                      val v = expr()
+                      if (peek() != ')') throw IllegalArgumentException()
+                      i++
+                      return v
+                  }
+                  val st = i
+                  while (peek().isDigit() || peek() == '.') i++
+                  if (st == i) throw IllegalArgumentException()
+                  return s.substring(st, i).toDouble()
+              }
+          }
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var recognizer: DigitalInkRecognizer
+              private lateinit var drawing: DrawingView
+              private val handler = Handler(Looper.getMainLooper())
+              private var modelReady = false
+              private var textScale = 1.0f
+              private var textMode = 0
+              private var caseMode = 0
+              private var activeMode = 0
+              private var activeCase = 0
+              private val mathMode get() = activeMode == 3
+              private var baseSize = 0f
+              private var nextGroup = 1
+              private val measurePaint = Paint().apply { typeface = Typeface.SANS_SERIF }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private val speechLauncher = registerForActivityResult(
+                  ActivityResultContracts.StartActivityForResult()
+              ) { result ->
+                  if (result.resultCode == RESULT_OK) {
+                      val matches = result.resultData?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                      val spokenText = matches?.get(0) ?: ""
+                      if (spokenText.isNotEmpty()) {
+                          Toast.makeText(this, "Voice: $spokenText", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  drawing = DrawingView(this)
+
+                  fun tool(label: String) = Button(this).apply { text = label; isAllCaps = false }
+                  val modeBtn = tool("✏️ Pen")
+                  val mathBtn = tool("Text")
+                  val caseBtn = tool("Aa")
+                  val micBtn = tool("🎙️ Mic")
+                  val minusBtn = tool("A−")
+                  val plusBtn = tool("A+")
+                  val scaleLabel = TextView(this).apply {
+                      text = "100%"; gravity = Gravity.CENTER; setPadding(dp(6), 0, dp(6), 0)
+                  }
+                  val saveBtn = tool("Save")
+                  val copyBtn = tool("Copy")
+                  val clearBtn = tool("Clear")
+
+                  val colors = listOf(
+                      Color.BLACK, 0xFFD32F2F.toInt(), 0xFF1976D2.toInt(),
+                      0xFF388E3C.toInt(), 0xFFF57C00.toInt()
+                  )
+                  val colorBtns = colors.map { c ->
+                      Button(this).apply {
+                          setBackgroundColor(c); setTextColor(Color.WHITE)
+                          minWidth = 0; minimumWidth = 0
+                          layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).also {
+                              it.setMargins(dp(4), dp(4), dp(4), dp(4))
+                          }
+                      }
+                  }
+                  fun refresh() {
+                      colorBtns.forEachIndexed { i, b -> b.text = if (colors[i] == drawing.penColor) "✓" else "" }
+                      modeBtn.text = if (drawing.eraser) "🧽 Eraser" else "✏️ Pen"
+                      mathBtn.text = arrayOf("Text", "Chem", "Math", "123")[textMode]
+                      caseBtn.text = arrayOf("Aa", "ABC", "abc")[caseMode]
+                      scaleLabel.text = "${Math.round(textScale * 100)}%"
+                  }
+
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                      addView(modeBtn)
+                      addView(mathBtn)
+                      addView(caseBtn)
+                      addView(micBtn)
+                      colorBtns.forEach { addView(it) }
+                      addView(minusBtn); addView(scaleLabel); addView(plusBtn)
+                      addView(saveBtn); addView(copyBtn); addView(clearBtn)
+                  }
+                  val bar = HorizontalScrollView(this).apply {
+                      setBackgroundColor(0xEEFFFFFF.toInt()); addView(row)
+                  }
+                  val frame = FrameLayout(this).apply {
+                      addView(drawing, FrameLayout.LayoutParams(-1, -1))
+                      addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+                  }
+                  setContentView(frame)
+                  refresh()
+
+                  modeBtn.setOnClickListener { drawing.eraser = !drawing.eraser; refresh() }
+                  mathBtn.setOnClickListener { textMode = (textMode + 1) % 4; refresh() }
+                  caseBtn.setOnClickListener { caseMode = (caseMode + 1) % 3; refresh() }
+                  micBtn.setOnClickListener {
+                      if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 101)
+                      } else {
+                          startVoiceRecognition()
+                      }
+                  }
+                  colors.forEachIndexed { i, c ->
+                      colorBtns[i].setOnClickListener {
+                          drawing.penColor = c; drawing.eraser = false; refresh()
+                      }
+                  }
+                  minusBtn.setOnClickListener { textScale = maxOf(0.5f, textScale - 0.1f); refresh() }
+                  plusBtn.setOnClickListener { textScale = minOf(3.0f, textScale + 0.1f); refresh() }
+                  clearBtn.setOnClickListener { drawing.clearAll(); baseSize = 0f }
+                  copyBtn.setOnClickListener {
+                      val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("text", drawing.plainText()))
+                      Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+                  }
+                  saveBtn.setOnClickListener {
+                      AlertDialog.Builder(this)
+                          .setTitle("Save")
+                          .setItems(arrayOf("Image (PNG)", "Text (.txt)")) { _, which ->
+                              if (which == 0) saveImage() else saveText()
+                          }.show()
+                  }
+
+                  setupRecognizer("en-US")
+                  drawing.onStrokeStarted = { handler.removeCallbacksAndMessages(null) }
+                  drawing.onStrokeFinished = {
+                      handler.removeCallbacksAndMessages(null)
+                      handler.postDelayed({ recognizeAndReplace() }, 800)
+                  }
+              }
+
+              private fun startVoiceRecognition() {
+                  val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
+                      putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak equations or text...")
+                  }
+                  try {
+                      speechLauncher.launch(intent)
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Speech recognition not supported.", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun saveImage() {
+                  try {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Images.Media.DISPLAY_NAME, "board_${System.currentTimeMillis()}.png")
+                          put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                          put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/InkToText")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)!!
+                      contentResolver.openOutputStream(uri)?.use {
+                          drawing.toBitmap().compress(Bitmap.CompressFormat.PNG, 100, it)
+                      }
+                      Toast.makeText(this, "Gallery లో Save అయింది", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Save failed", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun saveText() {
+                  try {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, "board_${System.currentTimeMillis()}.txt")
+                          put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/InkToText")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)!!
+                      contentResolver.openOutputStream(uri)?.use {
+                          it.write(drawing.plainText().toByteArray(Charsets.UTF_8))
+                      }
+                      Toast.makeText(this, "Downloads లో Save అయింది", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Save failed", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun setupRecognizer(tag: String) {
+                  val id = DigitalInkRecognitionModelIdentifier.fromLanguageTag(tag)!!
+                  val model = DigitalInkRecognitionModel.builder(id).build()
+                  recognizer = DigitalInkRecognition.getClient(
+                      DigitalInkRecognizerOptions.builder(model).build()
+                  )
+                  val manager = RemoteModelManager.getInstance()
+                  manager.isModelDownloaded(model).addOnSuccessListener { downloaded ->
+                      if (downloaded) { modelReady = true; return@addOnSuccessListener }
+                      Toast.makeText(this, "Model download అవుతోంది…", Toast.LENGTH_LONG).show()
+                      manager.download(model, DownloadConditions.Builder().build())
+                          .addOnSuccessListener {
+                              modelReady = true
+                              Toast.makeText(this, "సిద్ధం. వ్రాయండి!", Toast.LENGTH_SHORT).show()
+                          }
+                          .addOnFailureListener {
+                              Toast.makeText(this, "Download failed. Internet ఆన్ చేయండి.",
+                                  Toast.LENGTH_LONG).show()
+                          }
+                  }
+              }
+
+              private class Sym(var l: Float, var t: Float, var r: Float, var b: Float, val color: Int) {
+                  val strokes = mutableListOf<Ink.Stroke>()
+                  var text = ""
+                  var root = false
+                  var flat = false
+                  var fixed: String? = null
+                  val w get() = r - l
+                  val h get() = b - t
+                  val cy get() = (t + b) / 2
+                  val cx get() = (l + r) / 2
+              }
+
+              private class El(
+                  val kind: Int,
+                  val sym: Sym,
+                  val a: List<Sym> = emptyList(),
+                  val d: List<Sym> = emptyList()
+              ) {
+                  var l = 0f; var t = 0f; var r = 0f; var b = 0f
+                  var sup = false
+                  var sub = false
+                  val h get() = b - t
+                  val cy get() = (t + b) / 2
+                  init {
+                      val all = listOf(sym) + a + d
+                      l = all.minOf { it.l }; t = all.minOf { it.t }
+                      r = all.maxOf { it.r }; b = all.maxOf { it.b }
+                  }
+              }
+
+              private class Out {
+                  val items = mutableListOf<DrawingView.TextItem>()
+                  val lines = mutableListOf<DrawingView.LineItem>()
+                  val groups = HashMap<Int, DrawingView.Group>()
+              }
+
+              private class Res(
+                  val copy: String, val expr: String, val baseline: Float, val size: Float,
+                  val right: Float
+              )
+
+              private fun isRoot(st: Ink.Stroke, l: Float, t: Float, r: Float, b: Float): Boolean {
+                  val pts = st.points
+                  val w = r - l; val h = b - t
+                  if (pts.size < 10 || h < 30f || w < h * 0.9f || h < w * 0.2f) return false
+                  val first = pts.first(); val last = pts.last()
+                  if (first.x > l + 0.3f * w || first.y < t + 0.3f * h) return false
+                  if (last.x < l + 0.75f * w || last.y > t + 0.2f * h) return false
+                  var lowIdx = 0
+                  for (i in pts.indices) if (pts[i].y > pts[lowIdx].y) lowIdx = i
+                  val low = pts[lowIdx]
+                  if (lowIdx < 2 || lowIdx > pts.size * 3 / 4) return false
+                  if (low.x > l + 0.45f * w) return false
+                  if (low.y - first.y < 0.15f * h) return false
+                  if (low.y - last.y < 0.6f * h) return false
+                  return true
+              }
+
+              private fun canMerge(s: Sym, l: Float, t: Float, r: Float, b: Float): Boolean {
+                  val w2 = r - l; val h2 = b - t
+                  val cx2 = (l + r) / 2
+                  val inside = if (w2 <= s.w) cx2 >= s.l - 5 && cx2 <= s.r + 5
+                  else s.cx >= l - 5 && s.cx <= r + 5
+                  if (!inside) return false
+                  val ov = minOf(s.r, r) - maxOf(s.l, l)
+                  if (ov < 0.6f * minOf(s.w, w2)) return false
+                  val vo = minOf(s.b, b) - maxOf(s.t, t)
+                  val maxH = maxOf(s.h, h2, 20f)
+                  if (vo <= 0) {
+                      val gap = -vo
+                      val dot = minOf(s.h, h2) <= 0.3f * maxOf(s.h, h2) &&
+                              minOf(s.w, w2) <= 0.4f * maxOf(s.w, w2)
+                      val bars = s.w > 1.8f * maxOf(s.h, 8f) && w2 > 1.8f * maxOf(h2, 8f) &&
+                              minOf(s.w, w2) >= 0.5f * maxOf(s.w, w2)
+                      if (!(gap <= 0.12f * maxH || dot || bars)) return false
+                  }
+                  return true
+              }
+
+              private fun bounds(st: Ink.Stroke): FloatArray {
+                  var l = Float.MAX_VALUE; var t = Float.MAX_VALUE
+                  var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+                  for (p in st.points) {
+                      l = minOf(l, p.x); r = maxOf(r, p.x); t = minOf(t, p.y); b = maxOf(b, p.y)
+                  }
+                  return floatArrayOf(l, t, r, b)
+              }
+
+              private class Ln(
+                  val x1: Float, val y1: Float, val x2: Float, val y2: Float,
+                  val len: Float, val straight: Boolean
+              ) {
+                  val ang: Float get() {
+                      var a = Math.toDegrees(Math.atan2((y2 - y1).toDouble(), (x2 - x1).toDouble())).toFloat()
+                      while (a < 0f) a += 180f
+                      while (a >= 180f) a -= 180f
+                      return a
+                  }
+                  val horiz: Boolean get() = ang <= 30f || ang >= 150f
+                  val vert: Boolean get() = ang in 60f..120f
+              }
+
+              private fun lnOf(st: Ink.Stroke): Ln {
+                  val pts = st.points
+                  var len = 0f
+                  for (i in 1 until pts.size)
+                      len += Math.hypot((pts[i].x - pts[i - 1].x).toDouble(),
+                          (pts[i].y - pts[i - 1].y).toDouble()).toFloat()
+                  val a = pts.first(); val b = pts.last()
+                  val chord = Math.hypot((b.x - a.x).toDouble(), (b.y - a.y).toDouble()).toFloat()
+                  return Ln(a.x, a.y, b.x, b.y, len, len > 0f && chord >= 0.8f * len)
+              }
+
+              private fun lineBasedFixed(s: Sym): String? {
+                  if (s.strokes.size == 3) {
+                      val ls = s.strokes.map { lnOf(it) }
+                      if (ls.any { !it.straight || !it.horiz || it.len < 25f }) return null
+                      val lo = ls.minOf { it.len }; val hi = ls.maxOf { it.len }
+                      if (lo / hi < 0.6f) return null
+                      val bs = s.strokes.map { bounds(it) }
+                      val overlap = bs.minOf { it[2] } - bs.maxOf { it[0] }
+                      return if (overlap > 0.5f * lo) "≡" else null
+                  }
+                  if (s.strokes.size != 2) return null
+                  val p = lnOf(s.strokes[0]); val q = lnOf(s.strokes[1])
+                  if (!p.straight || !q.straight || p.len < 25f || q.len < 25f) return null
+                  val ratio = minOf(p.len, q.len) / maxOf(p.len, q.len)
+                  if (ratio < 0.6f) return null
+                  if (p.horiz && q.horiz) {
+                      val pb = bounds(s.strokes[0]); val qb = bounds(s.strokes[1])
+                      val overlap = minOf(pb[2], qb[2]) - maxOf(pb[0], qb[0])
+                      val gap = Math.abs((pb[1] + pb[3]) / 2 - (qb[1] + qb[3]) / 2)
+                      val longer = maxOf(p.len, q.len)
+                      return if (overlap > 0.5f * minOf(p.len, q.len) && gap > 0.08f * longer &&
+                          gap < longer) "=" else null
+                  }
+                  val h: Ln; val v: Ln
+                  if (p.horiz && q.vert) { h = p; v = q }
+                  else if (q.horiz && p.vert) { h = q; v = p }
+                  else return null
+                  val dpx = h.x2 - h.x1; val dpy = h.y2 - h.y1
+                  val dqx = v.x2 - v.x1; val dqy = v.y2 - v.y1
+                  val det = dpx * dqy - dpy * dqx
+                  if (Math.abs(det) < 1e-3f) return null
+                  val t = ((v.x1 - h.x1) * dqy - (v.y1 - h.y1) * dqx) / det
+                  val u = ((v.x1 - h.x1) * dpy - (v.y1 - h.y1) * dpx) / det
+                  return if (t in 0.3f..0.7f && u in 0.38f..0.62f) "+" else null
+              }
+
+              private fun bracketOf(s: Sym): String? {
+                  if (s.strokes.size != 1 || s.root || s.flat) return null
+                  val h = s.h
+                  if (h < 30f || h < 2.5f * s.w) return null
+                  val pts = s.strokes[0].points
+                  if (pts.size < 8) return null
+                  val a = pts.first(); val b = pts.last()
+                  val dx = b.x - a.x; val dy = b.y - a.y
+                  val chord = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                  if (chord < 0.6f * h) return null
+                  var maxPos = 0f; var maxNeg = 0f
+                  var bestAbs = 0f; var bestIdx = 0; var bx = 0f; var by = 0f
+                  for ((i, p) in pts.withIndex()) {
+                      val d = (dx * (p.y - a.y) - dy * (p.x - a.x)) / chord
+                      if (d > maxPos) maxPos = d
+                      if (d < maxNeg) maxNeg = d
+                      if (Math.abs(d) > bestAbs) { bestAbs = Math.abs(d); bestIdx = i; bx = p.x; by = p.y }
+                  }
+                  if (bestAbs < 0.1f * h) return null
+                  if (minOf(maxPos, -maxNeg) > 0.2f * maxOf(maxPos, -maxNeg)) return null
+                  val frac = bestIdx.toFloat() / (pts.size - 1)
+                  if (frac < 0.3f || frac > 0.7f) return null
+                  val t = if (Math.abs(dy) < 1e-3f) 0f else (by - a.y) / dy
+                  val chordX = a.x + t * dx
+                  return if (bx < chordX) "(" else ")"
+              }
+
+              private fun isArrow(s: Sym): Boolean {
+                  val bs = s.strokes.map { bounds(it) }
+                  val shaft = bs.maxByOrNull { it[2] - it[0] } ?: return false
+                  val sw = shaft[2] - shaft[0]; val sh = shaft[3] - shaft[1]
+                  if (sw < 40f || sw < 2.5f * maxOf(sh, 8f)) return false
+                  val sy = (shaft[1] + shaft[3]) / 2
+                  val others = bs.filter { it !== shaft }
+                  if (others.isEmpty()) return false
+                  for (o in others) {
+                      val ow = o[2] - o[0]; val oh = o[3] - o[1]
+                      val ox = (o[0] + o[2]) / 2; val oy = (o[1] + o[3]) / 2
+                      if (ow > 0.5f * sw || oh < 0.12f * sw || oh > 0.8f * sw || ow < 0.2f * oh) return false
+                      if (ox < shaft[0] + 0.72f * sw || Math.abs(oy - sy) > 0.6f * oh) return false
+                  }
+                  return true
+              }
+
+              private fun detectFixed(s: Sym): String? {
+                  val n = s.strokes.size
+                  if (s.root || n < 2 || n > 3) return null
+                  if (isArrow(s)) return "→"
+                  lineBasedFixed(s)?.let { return it }
+                  if (n != 2) return null
+                  val a = bounds(s.strokes[0]); val b = bounds(s.strokes[1])
+                  val wa = a[2] - a[0]; val ha = a[3] - a[1]
+                  val wb = b[2] - b[0]; val hb = b[3] - b[1]
+                  val flatA = wa > 1.8f * maxOf(ha, 8f)
+                  val flatB = wb > 1.8f * maxOf(hb, 8f)
+                  if (flatA && flatB) {
+                      return if (minOf(wa, wb) / maxOf(wa, wb) > 0.5f) "=" else null
+                  }
+                  val hz: FloatArray; val vt: FloatArray
+                  if (flatA && hb > 1.8f * maxOf(wb, 8f)) { hz = a; vt = b }
+                  else if (flatB && ha > 1.8f * maxOf(wa, 8f)) { hz = b; vt = a }
+                  else return null
+                  val hw = hz[2] - hz[0]; val vh = vt[3] - vt[1]
+                  val fx = ((vt[0] + vt[2]) / 2 - hz[0]) / hw
+                  val fy = ((hz[1] + hz[3]) / 2 - vt[1]) / vh
+                  val ratio = hw / vh
+                  return if (fx in 0.3f..0.7f && fy in 0.35f..0.65f && ratio in 0.55f..1.8f) "+" else null
+              }
+
+              private fun groupSymbols(list: List<DrawingView.PStroke>): List<Sym> {
+                  val syms = mutableListOf<Sym>()
+                  for (ps in list) {
+                      var l = Float.MAX_VALUE; var t = Float.MAX_VALUE
+                      var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+                      for (p in ps.stroke.points) {
+                          l = minOf(l, p.x); r = maxOf(r, p.x)
+                          t = minOf(t, p.y); b = maxOf(b, p.y)
+                      }
+                      val rootStroke = isRoot(ps.stroke, l, t, r, b)
+                      val host = if (rootStroke) null
+                      else syms.firstOrNull { !it.root && canMerge(it, l, t, r, b) }
+                      if (host != null) {
+                          host.strokes.add(ps.stroke)
+                          host.l = minOf(host.l, l); host.r = maxOf(host.r, r)
+                          host.t = minOf(host.t, t); host.b = maxOf(host.b, b)
+                      } else {
+                          syms.add(Sym(l, t, r, b, ps.color).also {
+                              it.strokes.add(ps.stroke); it.root = rootStroke
+                          })
+                      }
+                  }
+                  var joined = true
+                  while (joined) {
+                      joined = false
+                      loop@ for (i in syms.indices) for (j in syms.indices) {
+                          if (i == j) continue
+                          val a = syms[i]; val b = syms[j]
+                          if (a.root || b.root) continue
+                          if (canMerge(a, b.l, b.t, b.r, b.b)) {
+                              a.strokes.addAll(b.strokes)
+                              a.l = minOf(a.l, b.l); a.r = maxOf(a.r, b.r)
+                              a.t = minOf(a.t, b.t); a.b = maxOf(a.b, b.b)
+                              syms.removeAt(j)
+                              joined = true
+                              break@loop
+                          }
+                      }
+                  }
+                  for (s in syms) {
+                      s.flat = !s.root && s.strokes.size == 1 && s.w > 2f * maxOf(s.h, 10f)
+                      s.fixed = detectFixed(s) ?: bracketOf(s)
+                  }
+                  return syms.sortedBy { it.l }
+              }
+
+              private fun tickWidth(s: Sym) = minOf(s.h * 0.55f, s.w * 0.4f)
+
+              private fun buildElements(syms: List<Sym>): List<El> {
+                  if (syms.isEmpty()) return emptyList()
+                  val hs = syms.filter { !it.root && !it.flat }.map { it.h }.sorted()
+                  val refH = if (hs.isEmpty()) 40f else hs[hs.size / 2]
+                  val consumed = HashSet<Sym>()
+                  val blocks = mutableListOf<El>()
+                  for (c in syms.filter { it.root || it.flat }.sortedByDescending { it.w }) {
+                      if (c in consumed) continue
+                      if (c.root) {
+                          val tw = tickWidth(c)
+                          val inner = syms.filter {
+                              it !== c && it !in consumed && it.cx > c.l + tw - 5 && it.cx < c.r + 5 &&
+                                      it.cy > c.t && it.cy < c.b + c.h * 0.2f
+                          }
+                          if (inner.isEmpty()) continue
+                          consumed.add(c); consumed.addAll(inner)
+                          blocks.add(El(2, c, inner))
+                      } else {
+                          val near = syms.filter {
+                              it !== c && it !in consumed && it.cx >= c.l - 5 && it.cx <= c.r + 5 &&
+                                      Math.abs(it.cy - c.cy) < 4 * refH
+                          }
+                          val num = near.filter { it.cy < c.cy }
+                          val den = near.filter { it.cy >= c.cy }
+                          if (num.isEmpty() || den.isEmpty()) continue
+                          consumed.add(c); consumed.addAll(near)
+                          blocks.add(El(1, c, num, den))
+                      }
+                  }
+                  val plain = syms.filter { it !in consumed }.map {
+                      if (it.fixed == null && it.root) it.fixed = "√"
+                      if (it.fixed == null && it.flat) it.fixed = "-"
+                      El(0, it)
+                  }
+                  return (plain + blocks).sortedBy { it.l }
+              }
+
+              private fun groupLines(els: List<El>): List<List<El>> {
+                  val lines = mutableListOf<MutableList<El>>()
+                  for (e in els) {
+                      val line = lines.firstOrNull { ln ->
+                          val t = ln.minOf { it.t }; val b = ln.maxOf { it.b }; val h = b - t
+                          e.cy >= t - 0.8f * h && e.cy <= b + 0.3f * h
+                      }
+                      if (line != null) line.add(e) else lines.add(mutableListOf(e))
+                  }
+                  return lines.sortedBy { ln -> ln.minOf { it.t } }
+              }
+
+              private fun addRootLines(s: Sym, out: Out) {
+                  val tw = tickWidth(s)
+                  val ax = s.l; val ay = s.t + 0.62f * s.h
+                  val bx = s.l + 0.22f * tw; val by = s.t + 0.55f * s.h
+                  val cx = s.l + 0.55f * tw; val cy = s.b
+                  val dx = s.l + tw; val dy = s.t
+                  out.lines.add(DrawingView.LineItem(ax, ay, bx, by, s.color))
+                  out.lines.add(DrawingView.LineItem(bx, by, cx, cy, s.color))
+                  out.lines.add(DrawingView.LineItem(cx, cy, dx, dy, s.color))
+                  out.lines.add(DrawingView.LineItem(dx, dy, s.r, dy, s.color))
+              }
+
+              private class Seg(val syms: List<Sym>, val digit: Boolean) {
+                  var text = ""
+                  var cands: List<String> = emptyList()
+              }
+
+              private class Part(val kind: Int, val els: List<El>)
+
+              private var segMap: Map<Sym, Seg> = emptyMap()
+
+              private fun computeParts(els: List<El>): List<Part> {
+                  for (e in els) { e.sup = false; e.sub = false }
+                  val plain = els.filter { it.kind == 0 && it.sym.fixed == null }
+                  if (plain.size >= 2) {
+                      val hs = plain.map { it.h }.sorted()
+                      val refH = hs[Math.round((hs.size - 1) * 0.85f)]
+                      val tall = plain.filter { it.h >= 0.8f * refH }
+                      val refBottom = tall.map { it.b }.sorted()[tall.size / 2]
+                      val maxScript = if (activeMode == 0) 0.7f else 0.85f
+                      var script: El? = null
+                      var scriptSup = false
+                      var sawBase = false
+                      for (e in els) {
+                          if (e.kind != 0 || e.sym.fixed != null) { script = null; sawBase = true; continue }
+                          val u = script
+                          var kind = 0
+                          if (sawBase && e.h >= 0.25f * refH && e.h <= 1.05f * refH) {
+                              val small = e.h <= maxScript * refH
+                              val mid = e.h <= 0.85f * refH
+                              if (u != null && mid && Math.abs(e.cy - u.cy) < 0.7f * u.h &&
+                                  e.l - u.r < 1.5f * u.h)
+                                  kind = if (scriptSup) 1 else 2
+                              else if (mid && ((small && e.b <= refBottom - 0.35f * refH) ||
+                                          e.cy <= refBottom - 0.6f * refH)) kind = 1
+                              else if (mid && ((small && e.b >= refBottom + 0.1f * refH) ||
+                                          e.cy >= refBottom - 0.12f * refH)) kind = 2
+                              else if (!mid && e.b <= refBottom - 0.55f * refH) kind = 1
+                              else if (!mid && e.b >= refBottom + 0.45f * refH) kind = 2
+                          }
+                          if (kind == 1) { e.sup = true; script = e; scriptSup = true }
+                          else if (kind == 2) { e.sub = true; script = e; scriptSup = false }
+                          else { script = null; sawBase = true }
+                      }
+                  }
+
+                  val parts = mutableListOf<Part>()
+                  var cur = mutableListOf<El>()
+                  var curKind = 0
+                  fun flush() {
+                      if (cur.isNotEmpty()) { parts.add(Part(curKind, cur)); cur = mutableListOf() }
+                  }
+                  for (e in els) {
+                      if (e.kind != 0) { flush(); parts.add(Part(2, listOf(e))); continue }
+                      val k = if (e.sup) 1 else if (e.sub) 3 else if (e.sym.fixed != null) 4 else 0
+                      if (k == 4) { flush(); parts.add(Part(4, listOf(e))); continue }
+                      if (cur.isNotEmpty() && k != curKind) flush()
+                      curKind = k
+                      cur.add(e)
+                  }
+                  flush()
+                  return parts
+              }
+
+              private fun collect(els: List<El>, segs: MutableList<Seg>, map: MutableMap<Sym, Seg>) {
+                  for (p in computeParts(els)) {
+                      when (p.kind) {
+                          2 -> {
+                              val e = p.els[0]
+                              collect(buildElements(e.a), segs, map)
+                              if (e.kind == 1) collect(buildElements(e.d), segs, map)
+                          }
+                          4 -> {}
+                          else -> {
+                              val seg = Seg(p.els.map { it.sym }, p.kind != 0 || mathMode)
+                              segs.add(seg)
+                              map[seg.syms[0]] = seg
+                          }
+                      }
+                  }
+              }
+
+              private fun layoutLine(els: List<El>, parentSize: Float, out: Out): Res {
+                  if (els.isEmpty()) return Res("", "", 0f, 24f, 0f)
+                  val parts = computeParts(els)
+
+                  val normal = els.filter { !it.sup && !it.sub }
+                  val plainNormal = normal.filter { it.kind == 0 }
+                  val size = if (parentSize > 0f) parentSize else baseSize * textScale
+                  val ref = plainNormal.filter { it.sym.fixed == null }.ifEmpty { plainNormal }
+                  val baseline = if (ref.isNotEmpty())
+                      ref.map { it.b }.sorted()[ref.size / 2] else normal[0].cy
+                  val hsAll = ref.map { it.h }.sorted()
+                  val capH = if (hsAll.isEmpty()) 0f else hsAll[Math.round((hsAll.size - 1) * 0.85f)]
+                  val capRef = if (capH > 0f) capH else size
+
+                  val copy = StringBuilder()
+                  val expr = StringBuilder()
+                  var cursor = Float.NEGATIVE_INFINITY
+                  var prevR = Float.NEGATIVE_INFINITY
+                  var prevKind = -1
+                  var prevTight = false
+                  var prevFixed: String? = null
+                  for (p in parts) {
+                      val first = p.els[0]
+                      val color = first.sym.color
+                      when (p.kind) {
+                          0, 4 -> {
+                              val raw = if (p.kind == 4) first.sym.fixed ?: ""
+                              else (segMap[first.sym]?.text ?: "").replace("\n", " ")
+                              val sg = segMap[first.sym]
+                              val guesses = if (sg != null && sg.cands.isNotEmpty()) sg.cands else listOf(raw)
+                              val t = if (p.kind != 0) raw else when (activeMode) {
+                                  1 -> chemPick(guesses, p.els.map { it.sym }, capH)
+                                  2 -> caseOf(mathPick(guesses), true)
+                                  else -> caseOf(raw, false)
+                              }
+                              if (t.isNotEmpty()) {
+                                  measurePaint.textSize = size
+                                  val w = measurePaint.measureText(t)
+                                  val l = p.els.minOf { it.l }
+                                  val hg = if (prevR == Float.NEGATIVE_INFINITY) 0f else l - prevR
+                                  val bond = activeMode == 1 && p.kind == 4 && t in listOf("-", "=", "≡")
+                                  val tightNow = bond && hg <= 0.35f * capRef
+                                  val baseGap = if (hg > 0.5f * capRef) size * 0.3f else size * 0.06f
+                                  val gap = when {
+                                      tightNow -> size * 0.04f
+                                      prevKind == 4 && prevTight && hg <= 0.35f * capRef -> size * 0.04f
+                                      p.kind == 4 && t == ")" -> size * 0.03f
+                                      prevFixed == "(" -> size * 0.03f
+                                      p.kind == 4 && t == "(" -> baseGap
+                                      prevFixed == ")" -> baseGap
+                                      p.kind == 4 || prevKind == 4 -> size * 0.25f
+                                      else -> baseGap
+                                  }
+                                  prevTight = tightNow
+                                  val left = if (cursor == Float.NEGATIVE_INFINITY) l else cursor + gap
+                                  out.items.add(DrawingView.TextItem(t, t, left + w / 2, baseline,
+                                      size, color, false))
+                                  cursor = left + w
+                              }
+                              copy.append(t); expr.append(t)
+                          }
+                          1, 3 -> {
+                              val isSup = p.kind == 1
+                              val t = segMap[first.sym]?.text ?: ""
+                              if (t.isNotEmpty()) {
+                                  val sz = size * 0.6f
+                                  measurePaint.textSize = sz
+                                  val w = measurePaint.measureText(t)
+                                  val left = if (cursor == Float.NEGATIVE_INFINITY) p.els.minOf { it.l }
+                                  else cursor + size * 0.03f
+                                  val y = if (isSup) baseline - size * 0.40f else baseline + size * 0.22f
+                                  out.items.add(DrawingView.TextItem(t, if (isSup) toSuper(t) else toSub(t),
+                                      left + w / 2, y, sz, color, true))
+                                  cursor = left + w
+                                  copy.append(if (isSup) toSuper(t) else toSub(t))
+                                  if (isSup) expr.append("^(").append(t).append(")")
+                              }
+                          }
+                          else -> {
+                              val s = first.sym
+                              if (first.kind == 1) {
+                                  out.lines.add(DrawingView.LineItem(s.l, s.cy, s.r, s.cy, s.color))
+                                  val n = layoutLine(buildElements(first.a), size * 0.85f, out)
+                                  val d = layoutLine(buildElements(first.d), size * 0.85f, out)
+                                  copy.append("(").append(n.copy).append(")/(").append(d.copy).append(")")
+                                  expr.append("((").append(n.expr).append(")/(").append(d.expr).append("))")
+                              } else {
+                                  addRootLines(s, out)
+                                  val inner = layoutLine(buildElements(first.a), size, out)
+                                  copy.append("√(").append(inner.copy).append(")")
+                                  expr.append("sqrt(").append(inner.expr).append(")")
+                              }
+                              cursor = maxOf(cursor, first.r)
+                          }
+                      }
+                      prevR = p.els.maxOf { it.r }
+                      prevKind = p.kind
+                      prevFixed = if (p.kind == 4) first.sym.fixed else null
+                  }
+                  return Res(copy.toString(), expr.toString(), baseline, size,
+                      if (cursor == Float.NEGATIVE_INFINITY) els.maxOf { it.r } else cursor)
+              }
+
+              private fun layoutAll(syms: List<Sym>): Out {
+                  val out = Out()
+                  if (baseSize == 0f) {
+                      val hs = syms.filter { !it.root && !it.flat }.map { it.h }.sorted()
+                      baseSize = if (hs.isEmpty()) 64f * resources.displayMetrics.density
+                      else (hs[hs.size / 2] / 0.72f).coerceIn(40f, 200f)
+                  }
+                  for (line in groupLines(buildElements(syms))) {
+                      val sorted = line.sortedBy { it.l }
+                      val i0 = out.items.size
+                      val l0 = out.lines.size
+                      val res = layoutLine(sorted, 0f, out)
+                      var copy = res.copy
+
+                      if (copy.trimEnd().endsWith("=")) {
+                          val v = evaluate(res.expr)
+                          if (v != null) {
+                              val ans = formatNumber(v)
+                              measurePaint.textSize = res.size
+                              val w = measurePaint.measureText(ans)
+                              val cx = res.right + res.size * 0.3f + w / 2
+                              out.items.add(DrawingView.TextItem(ans, ans, cx, res.baseline,
+                                  res.size, 0xFF2E7D32.toInt(), false))
+                              copy = copy.trimEnd() + ans
+                          }
+                      }
+
+                      if (out.items.size == i0) continue
+                      val gid = nextGroup++
+                      var x0 = Float.MAX_VALUE
+                      for (k in i0 until out.items.size) {
+                          out.items[k].group = gid
+                          x0 = minOf(x0, out.items[k].cx)
+                      }
+                      for (k in l0 until out.lines.size) out.lines[k].group = gid
+                      out.groups[gid] = DrawingView.Group(copy, res.baseline, x0, res.size, out.items.size - i0)
+                  }
+                  return out
+              }
+
+              private fun evaluate(raw: String): Double? {
+                  var s = raw.replace(" ", "").trimEnd('=')
+                  s = s.replace('×', '*').replace('x', '*').replace('X', '*').replace('·', '*')
+                      .replace('÷', '/').replace('−', '-').replace('–', '-').replace('—', '-')
+                      .replace(',', '.')
+                  val check = s.replace("sqrt", "")
+                  if (s.isEmpty() || !check.all { it in "0123456789+-*/^()." }) return null
+                  return try {
+                      val v = Parser(s).parse()
+                      if (v.isNaN() || v.isInfinite()) null else v
+                  } catch (e: Exception) { null }
+              }
+
+              private fun formatNumber(v: Double): String {
+                  if (Math.abs(v - Math.rint(v)) < 1e-9 && Math.abs(v) < 1e15)
+                      return Math.rint(v).toLong().toString()
+                  return String.format(java.util.Locale.US, "%.4f", v).trimEnd('0').trimEnd('.')
+              }
+
+              private val elements = ("H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe " +
+                  "Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba " +
+                  "La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn " +
+                  "Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr").split(" ").toSet()
+
+              private fun chemFix(s0: String, syms: List<Sym>, capH: Float): String {
+                  if (s0.length != syms.size) return s0
+                  val sb = StringBuilder()
+                  var prevUpper = false
+                  for (i in s0.indices) {
+                      var c = s0[i]
+                      if (c == '0' && (sb.isEmpty() || !sb.last().isDigit())) c = 'O'
+                      if (!c.isLetter()) { sb.append(c); prevUpper = false; continue }
+                      val tall = capH <= 0f || syms[i].h >= 0.78f * capH
+                      val canFollow = prevUpper && elements.contains("" + sb.last() + c.lowercaseChar())
+                      val single = elements.contains(c.uppercaseChar().toString())
+                      val lower = if (canFollow) (!tall || !single) else !tall
+                      sb.append(if (lower) c.lowercaseChar() else c.uppercaseChar())
+                      prevUpper = !lower
+                  }
+                  return sb.toString()
+              }
+
+              private fun chemValid(s: String): Boolean {
+                  if (s.isEmpty()) return false
+                  var i = 0
+                  while (i < s.length) {
+                      val c = s[i]
+                      if (c.isUpperCase()) {
+                          if (i + 1 < s.length && s[i + 1].isLowerCase()) {
+                              if (!elements.contains("" + c + s[i + 1])) return false
+                              i += 2
+                          } else {
+                              if (!elements.contains(c.toString())) return false
+                              i++
+                          }
+                      } else if (c.isLowerCase()) {
+                          if (c in "nxslgaq") i++ else return false
+                      } else i++
+                  }
+                  return true
+              }
+
+              private fun caseOf(s: String, defaultLower: Boolean): String = when (activeCase) {
+                  1 -> s.uppercase()
+                  2 -> s.lowercase()
+                  else -> if (defaultLower) s.lowercase() else s
+              }
+
+              private fun mathPick(cands: List<String>): String {
+                  if (cands.isEmpty()) return ""
+                  val vars = "xyzabcnmkt"
+                  var best = cands[0].replace(" ", "")
+                  var bestScore = Float.MAX_VALUE
+                  for ((i, c0) in cands.take(8).withIndex()) {
+                      val c = c0.replace(" ", "")
+                      var bad = 0; var letters = 0
+                      for (ch in c) if (ch.isLetter()) {
+                          letters++
+                          if (ch.lowercaseChar() !in vars) bad++
+                      }
+                      val score = i * 0.6f + bad * 3f + letters * 0.5f
+                      if (score < bestScore) { bestScore = score; best = c }
+                  }
+                  return best.replace(Regex("(?<=\\d)[xX](?=\\d)"), "×")
+              }
+
+              private val stateRegex = Regex("\\(([sSlLgG]|[aA][qQ])\\)")
+
+              private fun chemPick(cands: List<String>, syms: List<Sym>, capH: Float): String {
+                  var firstFixed: String? = null
+                  for (c in cands.take(8)) {
+                      val f = chemFix(c.replace(" ", ""), syms, capH)
+                          .replace(stateRegex) { m -> "(" + m.groupValues[1].lowercase() + ")" }
+                      if (firstFixed == null) firstFixed = f
+                      if (chemValid(f)) return f
+                  }
+                  return firstFixed ?: ""
+              }
+
+              private class Task(val ink: Ink, val digit: Boolean, val set: (List<String>) -> Unit)
+
+              private fun pickDigit(cands: List<String>): String {
+                  val allowed = "0123456789+-−×÷=()./,"
+                  for (c in cands.take(5)) if (c.length == 1 && c[0] in allowed) return c
+                  return cands.firstOrNull() ?: "?"
+              }
+
+              private fun recognizeAndReplace() {
+                  if (!modelReady) return
+                  val snapshot = drawing.pending.toList()
+                  if (snapshot.isEmpty()) return
+                  val mode = textMode
+                  val cs = caseMode
+                  activeMode = mode
+                  activeCase = cs
+                  val syms = groupSymbols(snapshot)
+
+                  val order = java.util.IdentityHashMap<Ink.Stroke, Int>()
+                  snapshot.forEachIndexed { i, ps -> order[ps.stroke] = i }
+                  fun inkOf(strokes: List<Ink.Stroke>): Ink {
+                      val ordered = strokes.sortedBy { order[it] ?: 0 }
+                      var mnx = Float.MAX_VALUE; var mny = Float.MAX_VALUE; var mxy = -Float.MAX_VALUE
+                      for (st in ordered) for (pt in st.points) {
+                          mnx = minOf(mnx, pt.x); mny = minOf(mny, pt.y); mxy = maxOf(mxy, pt.y)
+                      }
+                      val h = mxy - mny
+                      val target = 0.1f * drawing.height
+                      val k = if (h > 1f && h < target) target / h else 1f
+                      val b = Ink.builder()
+                      for (st in ordered) {
+                          if (k == 1f) { b.addStroke(st); continue }
+                          val sb = Ink.Stroke.builder()
+                          for (pt in st.points) sb.addPoint(
+                              Ink.Point.create((pt.x - mnx) * k + 50f, (pt.y - mny) * k + 50f, pt.timestamp ?: 0L))
+                          b.addStroke(sb.build())
+                      }
+                      return b.build()
+                  }
+
+                  val segs = mutableListOf<Seg>()
+                  val map = HashMap<Sym, Seg>()
+                  for (line in groupLines(buildElements(syms))) collect(line.sortedBy { it.l }, segs, map)
+
+                  val tasks = mutableListOf<Task>()
+                  for (seg in segs) {
+                      if (seg.digit) {
+                          for (s in seg.syms) {
+                              val f = s.fixed
+                              if (f != null) s.text = f
+                              else tasks.add(Task(inkOf(s.strokes), true) { c -> s.text = pickDigit(c) })
+                          }
+                      } else {
+                          tasks.add(Task(inkOf(seg.syms.flatMap { it.strokes }), false) { c ->
+                              seg.cands = c
+                              seg.text = c.firstOrNull() ?: ""
+                          })
+                      }
+                  }
+                  if (tasks.isEmpty()) { finish(snapshot, syms, segs, map, mode, cs); return }
+
+                  val ctx = RecognitionContext.builder()
+                      .setPreContext("")
+                      .setWritingArea(WritingArea(drawing.width.toFloat(), drawing.height.toFloat()))
+                      .build()
+                  var remaining = tasks.size
+                  for (task in tasks) {
+                      recognizer.recognize(task.ink, ctx)
+                          .addOnSuccessListener { r ->
+                              val c = r.candidates.map { it.text }
+                              task.set(c)
+                          }
+                          .addOnFailureListener { task.set(listOf("?")) }
+                          .addOnCompleteListener {
+                              remaining--
+                              if (remaining == 0) finish(snapshot, syms, segs, map, mode, cs)
+                          }
+                  }
+              }
+
+              private fun finish(
+                  snapshot: List<DrawingView.PStroke>, syms: List<Sym>,
+                  segs: List<Seg>, map: Map<Sym, Seg>, mode: Int, cs: Int
+              ) {
+                  activeMode = mode
+                  activeCase = cs
+                  for (seg in segs) if (seg.digit) seg.text = seg.syms.joinToString("") { it.text }
+                  segMap = map
+                  val out = layoutAll(syms)
+                  drawing.commit(snapshot, out.items, out.lines, out.groups)
+              }
+
+              private val supMap = mapOf(
+                  '0' to '⁰', '1' to '¹', '2' to '²', '3' to '³', '4' to '⁴',
+                  '5' to '⁵', '6' to '⁶', '7' to '⁷', '8' to '⁸', '9' to '⁹',
+                  '+' to '⁺', '-' to '⁻', 'n' to 'ⁿ', 'i' to 'ⁱ', 'x' to 'ˣ'
+              )
+
+              private fun toSuper(t: String): String {
+                  val sb = StringBuilder()
+                  for (c in t) sb.append(supMap[c] ?: return "^($t)")
+                  return sb.toString()
+              }
+
+              private val subMap = mapOf(
+                  '0' to '₀', '1' to '₁', '2' to '₂', '3' to '₃', '4' to '₄',
+                  '5' to '₅', '6' to '₆', '7' to '₇', '8' to '₈', '9' to '₉',
+                  '+' to '₊', '-' to '₋', 'n' to 'ₙ', 'x' to 'ₓ'
+              )
+
+              private fun toSub(t: String): String {
+                  val sb = StringBuilder()
+                  for (c in t) sb.append(subMap[c] ?: return "_($t)")
+                  return sb.toString()
+              }
+
+              override fun onDestroy() { recognizer.close(); super.onDestroy() }
+          }
+          EOF_INK
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: InkToText-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
